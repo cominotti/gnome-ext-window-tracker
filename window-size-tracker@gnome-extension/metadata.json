@@ -1,0 +1,9 @@
+{
+    "uuid": "window-size-tracker@gnome-extension",
+    "name": "Window Size Tracker",
+    "description": "Tracks window sizes when resized or closed and restores them when applications are relaunched. Works across GNOME sessions on Wayland.",
+    "shell-version": ["49"],
+    "version": 3,
+    "url": "https://github.com/example/window-size-tracker",
+    "session-modes": ["user"]
+}
