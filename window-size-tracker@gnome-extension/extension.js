@@ -25,6 +25,8 @@ const WINDOW_READY_TIMEOUT_MS = 100;    // Time to wait for window to become rea
 const WINDOW_READY_MAX_ATTEMPTS = 50;   // Max attempts to wait for window ready
 const RESTORE_FALLBACK_DELAY_MS = 50;   // Fallback delay if first-frame doesn't fire
 const MIN_WINDOW_SIZE = 50;             // Minimum valid window dimension
+const NAUTILUS_LOCATION_WAIT_MS = 100;  // Interval to wait for Nautilus location ID
+const NAUTILUS_LOCATION_MAX_ATTEMPTS = 5; // Max attempts (500ms total)
 
 // =============================================================================
 // DATA STORAGE CLASS
@@ -426,7 +428,30 @@ class WindowSizeManager {
         
         return null;
     }
-    
+
+    /**
+     * Checks if a window belongs to Nautilus file manager.
+     * Used to apply special handling for location-based window IDs.
+     */
+    _isNautilusWindow(window) {
+        const tracker = Shell.WindowTracker.get_default();
+        const app = tracker.get_window_app(window);
+        if (!app) return false;
+        const appId = app.get_id();
+        return appId && appId.toLowerCase().includes('nautilus');
+    }
+
+    /**
+     * Checks if a window ID is location-based (GNOME dynamic association).
+     * These IDs are created for Nautilus windows showing specific locations.
+     */
+    _isLocationBasedId(windowId) {
+        if (!windowId) return false;
+        return windowId.startsWith('location:') ||
+               windowId.startsWith('mountable-volume:') ||
+               windowId.startsWith('network:');
+    }
+
     /**
      * Starts tracking a window for size changes.
      */
@@ -576,46 +601,111 @@ class WindowSizeManager {
     
     /**
      * Schedules size restoration for a newly created window.
+     * For Nautilus windows, waits for location-based ID before restoring.
+     */
+    _scheduleRestoration(window) {
+        const windowId = this._getWindowId(window);
+
+        if (!windowId)
+            return;
+
+        // For Nautilus windows with generic ID, wait for potential location-based ID
+        // GNOME dynamically updates Nautilus window app IDs to include location info
+        if (windowId === 'org.gnome.nautilus') {
+            console.log(`[WindowSizeTracker] Nautilus window detected, waiting for location ID...`);
+            this._waitForNautilusLocationId(window, 0);
+            return;
+        }
+
+        // Normal restoration flow for non-Nautilus windows
+        this._doRestoration(window, windowId);
+    }
+
+    /**
+     * Waits for Nautilus window to get a location-based app ID.
+     * GNOME updates the app association shortly after window creation.
+     */
+    _waitForNautilusLocationId(window, attempt) {
+        if (attempt >= NAUTILUS_LOCATION_MAX_ATTEMPTS) {
+            // Give up waiting, use generic nautilus ID
+            console.log(`[WindowSizeTracker] No location ID after ${attempt} attempts, using generic "org.gnome.nautilus"`);
+            this._doRestoration(window, 'org.gnome.nautilus');
+            return;
+        }
+
+        // Clear any existing pending restoration for this window
+        this._clearPendingRestoration(window);
+
+        const timeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            NAUTILUS_LOCATION_WAIT_MS,
+            () => {
+                this._pendingRestoration.delete(window);
+
+                // Check if window is still valid
+                try {
+                    if (!window.get_compositor_private())
+                        return GLib.SOURCE_REMOVE;
+                } catch (e) {
+                    return GLib.SOURCE_REMOVE;
+                }
+
+                const newId = this._getWindowId(window);
+
+                if (this._isLocationBasedId(newId)) {
+                    // Got location-based ID, proceed with restoration
+                    console.log(`[WindowSizeTracker] Nautilus location ID detected: "${newId}"`);
+                    this._doRestoration(window, newId);
+                } else {
+                    // Still generic, keep waiting
+                    console.log(`[WindowSizeTracker] Waiting for Nautilus location ID (attempt ${attempt + 1})...`);
+                    this._waitForNautilusLocationId(window, attempt + 1);
+                }
+
+                return GLib.SOURCE_REMOVE;
+            }
+        );
+
+        this._pendingRestoration.set(window, { timeoutId });
+    }
+
+    /**
+     * Performs the actual restoration for a window with a known stable ID.
      * Uses a multi-pronged approach for fastest possible restoration:
      * 1. Try immediate restoration (window may already be ready)
      * 2. Connect to first-frame signal on the actor (fires just before first paint)
      * 3. Set a short fallback timeout in case first-frame doesn't fire
      */
-    _scheduleRestoration(window) {
-        const windowId = this._getWindowId(window);
-        
-        if (!windowId)
-            return;
-        
+    _doRestoration(window, windowId) {
         // Create a unique key for this window instance
         const windowInstanceKey = `${windowId}:${window.get_stable_sequence()}`;
-        
+
         // Check if already restored
         if (this._restoredWindows.has(windowInstanceKey))
             return;
-        
+
         // Get saved size
         const savedSize = this._dataStore.get(windowId);
-        
+
         if (!savedSize) {
             console.log(`[WindowSizeTracker] STATE RESTORE: No saved state for "${windowId}"`);
             return;
         }
-        
+
         console.log(`[WindowSizeTracker] STATE RESTORE: Found saved state for "${windowId}" -> ${savedSize.width}x${savedSize.height}, attempting restoration...`);
-        
+
         // Clear any existing pending restoration
         this._clearPendingRestoration(window);
-        
+
         // Strategy 1: Try immediate restoration - window might already be ready
         const immediateSuccess = this._restoreWindowSize(window, savedSize, windowInstanceKey);
         if (immediateSuccess) {
             return;
         }
-        
+
         // Strategy 2 & 3: Use first-frame signal with fallback timeout
         const pending = {};
-        
+
         // Get the window actor for first-frame signal
         const actor = window.get_compositor_private();
         if (actor) {
@@ -624,7 +714,7 @@ class WindowSizeManager {
                 this._restoreWindowSize(window, savedSize, windowInstanceKey);
             });
         }
-        
+
         // Fallback timeout in case first-frame doesn't fire or window needs more time
         pending.timeoutId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
@@ -641,14 +731,14 @@ class WindowSizeManager {
                 pending.signalId = null;
                 pending.timeoutId = null;
                 this._pendingRestoration.delete(window);
-                
+
                 // Attempt restoration with retry logic
                 this._attemptRestoration(window, savedSize, windowInstanceKey, 0);
-                
+
                 return GLib.SOURCE_REMOVE;
             }
         );
-        
+
         this._pendingRestoration.set(window, pending);
     }
     
